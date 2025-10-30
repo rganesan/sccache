@@ -428,6 +428,92 @@ type = "DANGEROUSLY_INSECURE"
 ```
 
 
+## Automatic Local Retry on Remote Compilation Failure
+
+By default, if a distributed compilation job runs successfully on a remote server but the compiler itself returns a non-zero exit code (compilation error), sccache will return that error to the user. This is the expected behavior as it indicates a genuine compilation problem.
+
+However, in some scenarios, remote build environments may have unexpected issues that cause compilation to fail remotely while the same code would compile successfully locally. For these cases, sccache provides an automatic retry mechanism.
+
+### Enabling Automatic Retry
+
+You can enable automatic local retry when remote compilation fails by setting one of the following:
+
+**In your client config file** (`~/.config/sccache/config` on Linux):
+```toml
+[dist]
+scheduler_url = "https://192.168.1.1:10600"
+# ... other settings ...
+retry_on_compile_fail = true
+```
+
+**Or via environment variable** (overrides config file):
+```bash
+export SCCACHE_DIST_RETRY_ON_COMPILE_FAIL=true
+# Accepts: true/on/1 to enable, false/off/0 to disable
+```
+
+### How It Works
+
+When `retry_on_compile_fail` is enabled:
+
+1. sccache attempts distributed compilation as usual
+2. The job is allocated to a remote server and executes
+3. If the remote compiler returns a non-zero exit code:
+   - sccache automatically falls back to local compilation
+   - A warning is logged indicating the retry: `Remote compilation failed with exit code X, will retry locally`
+   - The compilation runs locally using your local toolchain
+   - The result is marked as `DistType::Error` for tracking purposes
+4. If the remote compiler succeeds (exit code 0), no retry occurs
+
+### When to Use This Feature
+
+This feature is useful when remote compilation fails due to environment differences while the same code compiles successfully locally:
+
+- **Preprocessor-stripped content**: Code using comment-based compiler directives (e.g., `/* fallthrough */` for `-Wimplicit-fallthrough`) that work locally but fail remotely because the preprocessor strips comments before distributed compilation
+- **Remote environment issues**: Unexpected compilation errors on remote servers that don't occur locally, such as resource constraints or configuration differences
+
+### Important Considerations
+
+- **Not for debugging**: This feature is not intended to mask genuine compilation errors. If code fails to compile, you should fix the code, not rely on local retry.
+- **Performance impact**: Failed remote compilations still consume time and resources before falling back to local.
+- **Monitoring**: Watch your logs for retry warnings to identify patterns of remote compilation failures.
+
+### Example Scenario
+
+**Fallthrough comments with -Wimplicit-fallthrough**
+
+Your code uses comment-based fallthrough annotations that work locally but fail in distributed compilation:
+
+```c
+switch (value) {
+    case 1:
+        do_something();
+        /* fallthrough */
+    case 2:
+        do_something_else();
+        break;
+}
+```
+
+```bash
+# Compiling with -Wimplicit-fallthrough
+# Without retry_on_compile_fail: distributed compilation fails
+$ sccache gcc -Wimplicit-fallthrough -o app app.c
+error: this statement may fall through [-Werror=implicit-fallthrough=]
+# Remote compiler doesn't see the comment (preprocessor stripped it)
+
+# With retry_on_compile_fail=true: automatically retries locally
+$ export SCCACHE_DIST_RETRY_ON_COMPILE_FAIL=true
+$ sccache gcc -Wimplicit-fallthrough -o app app.c
+# Logs: [app.c]: Remote compilation failed with exit code 1, will retry locally
+# Compilation succeeds locally (compiler sees the original comment)
+```
+
+This occurs because distributed compilation sends preprocessed code to the remote server, and `cpp` strips out comments. The local compiler sees the original source with the `/* fallthrough */` comment intact, so `-Wimplicit-fallthrough` works correctly.
+
+The solution is to adjust your code to use `__attribute__((fallthrough))` instead of comments, which is preserved through preprocessing.
+
+
 # Building the Distributed Server Binaries
 
 Until these binaries [are included in releases](https://github.com/mozilla/sccache/issues/393) I've put together a Docker container that can be used to easily build a release binary:
