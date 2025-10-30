@@ -819,6 +819,25 @@ where
             dist::RunJobResult::Complete(jc) => jc,
             dist::RunJobResult::JobNotFound => bail!("Job {} not found on server", job_id),
         };
+
+        // Check if we should retry locally on remote compile failure
+        let retry_enabled = dist_client.retry_on_compile_fail();
+        let exit_code = jc.output.exit_code();
+        debug!(
+            "[{}]: Remote compile completed: exit_code={}, retry_on_compile_fail={}",
+            out_pretty, exit_code, retry_enabled
+        );
+        if retry_enabled && exit_code != 0 {
+            warn!(
+                "[{}]: Remote compilation failed with exit code {}, will retry locally",
+                out_pretty, exit_code
+            );
+            bail!(
+                "Remote compilation failed with exit code {}, will retry locally",
+                exit_code
+            );
+        }
+
         debug!(
             "fetched {:?}",
             jc.outputs
@@ -889,10 +908,19 @@ where
             } else {
                 // `{:#}` prints the error and the causes in a single line.
                 let errmsg = format!("{:#}", e);
-                warn!(
-                    "[{}]: Could not perform distributed compile, falling back to local: {}",
-                    out_pretty2, errmsg
-                );
+
+                // Check if this is a remote compile failure that should be retried locally
+                if errmsg.contains("Remote compilation failed with exit code") && errmsg.contains("will retry locally") {
+                    warn!(
+                        "[{}]: {}",
+                        out_pretty2, errmsg
+                    );
+                } else {
+                    warn!(
+                        "[{}]: Could not perform distributed compile, falling back to local: {}",
+                        out_pretty2, errmsg
+                    );
+                }
 
                 compile_cmd
                     .execute(service, &creator)
@@ -2992,6 +3020,132 @@ LLVM version: 6.0",
             assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         }
     }
+
+    #[test_case(true ; "with preprocessor cache")]
+    #[test_case(false ; "without preprocessor cache")]
+    #[cfg(feature = "dist-client")]
+    fn test_compiler_retry_on_compile_fail(preprocessor_cache_mode: bool) {
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        let runtime = Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+
+        // Create a dist client that simulates remote compilation failure
+        // with exit code 1, but has retry_on_compile_fail enabled
+        const REMOTE_COMPILER_STDOUT: &[u8] = b"remote compiler stdout";
+        const REMOTE_COMPILER_STDERR: &[u8] = b"remote compiler stderr";
+        let dist_client = test_dist::RemoteCompileFailClient::new(
+            1, // non-zero exit code
+            REMOTE_COMPILER_STDOUT.to_vec(),
+            REMOTE_COMPILER_STDERR.to_vec(),
+        );
+
+        // Write a dummy input file so the preprocessor cache mode can work
+        std::fs::write(f.tempdir.path().join("foo.c"), "int main() { return 0; }").unwrap();
+        let storage = DiskCache::new(
+            f.tempdir.path().join("cache"),
+            u64::MAX,
+            &pool,
+            PreprocessorCacheModeConfig {
+                use_preprocessor_cache_mode: preprocessor_cache_mode,
+                ..Default::default()
+            },
+            CacheMode::ReadWrite,
+        );
+        let storage = Arc::new(storage);
+
+        // Pretend to be GCC.
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        let c = get_compiler_info(
+            creator.clone(),
+            &gcc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            &pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+
+        const LOCAL_COMPILER_STDOUT: &[u8] = b"local compiler stdout";
+        const LOCAL_COMPILER_STDERR: &[u8] = b"local compiler stderr";
+        let obj = f.tempdir.path().join("foo.o");
+
+        // The preprocessor invocation (for the local retry after remote failure).
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        // The local compiler invocation (after remote compilation fails).
+        let o = obj.clone();
+        next_command_calls(&creator, move |_| {
+            // Pretend to compile something locally.
+            let mut f = File::create(&o)?;
+            f.write_all(b"local compiled file contents")?;
+            Ok(MockChild::new(
+                exit_status(0),
+                LOCAL_COMPILER_STDOUT,
+                LOCAL_COMPILER_STDERR,
+            ))
+        });
+
+        let cwd = f.tempdir.path();
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+            CompilerArguments::Ok(h) => h,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+
+        let service = server::SccacheService::mock_with_dist_client(
+            dist_client.clone(),
+            storage.clone(),
+            pool.clone(),
+        );
+
+        if obj.is_file() {
+            fs::remove_file(&obj).unwrap();
+        }
+
+        let mut hasher = hasher.clone();
+        let (cached, res) = hasher
+            .get_cached_or_compile(
+                &service,
+                Some(dist_client.clone()),
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::ForceRecache,
+                pool.clone(),
+            )
+            .wait()
+            .expect("Should succeed with local compilation after remote failure");
+
+        // Ensure that the object file was created
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
+
+        // Should be marked as DistType::Error since remote compilation failed
+        match cached {
+            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::Error, _, f) => {
+                // wait on cache write future so we don't race with it!
+                f.wait().unwrap();
+            }
+            _ => panic!("Unexpected compile result: {:?}", cached),
+        }
+
+        // Should have the local compiler output, not the remote one
+        assert_eq!(exit_status(0), res.status);
+        assert_eq!(LOCAL_COMPILER_STDOUT, res.stdout.as_slice());
+        assert_eq!(LOCAL_COMPILER_STDERR, res.stderr.as_slice());
+    }
 }
 
 #[cfg(test)]
@@ -3051,6 +3205,9 @@ mod test_dist {
         fn rewrite_includes_only(&self) -> bool {
             false
         }
+        fn retry_on_compile_fail(&self) -> bool {
+            false
+        }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
         }
@@ -3103,6 +3260,9 @@ mod test_dist {
             Ok((self.tc.clone(), None))
         }
         fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn retry_on_compile_fail(&self) -> bool {
             false
         }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
@@ -3172,6 +3332,9 @@ mod test_dist {
             Ok((self.tc.clone(), None))
         }
         fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn retry_on_compile_fail(&self) -> bool {
             false
         }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
@@ -3249,6 +3412,9 @@ mod test_dist {
             ))
         }
         fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn retry_on_compile_fail(&self) -> bool {
             false
         }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
@@ -3347,6 +3513,111 @@ mod test_dist {
         }
         fn rewrite_includes_only(&self) -> bool {
             false
+        }
+        fn retry_on_compile_fail(&self) -> bool {
+            false
+        }
+        fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub struct RemoteCompileFailClient {
+        has_started: AtomicBool,
+        tc: Toolchain,
+        output: ProcessOutput,
+    }
+
+    impl RemoteCompileFailClient {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
+            Arc::new(Self {
+                has_started: AtomicBool::default(),
+                tc: Toolchain {
+                    archive_id: "somearchiveid".to_owned(),
+                },
+                output: ProcessOutput::fake_output(code, stdout, stderr),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl dist::Client for RemoteCompileFailClient {
+        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+            assert!(
+                !self
+                    .has_started
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+            );
+            assert_eq!(self.tc, tc);
+
+            Ok(AllocJobResult::Success {
+                job_alloc: JobAlloc {
+                    auth: "abcd".to_owned(),
+                    job_id: JobId(0),
+                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
+                },
+                need_toolchain: true,
+            })
+        }
+        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
+            unreachable!("fn do_get_status is not used for this test. qed")
+        }
+        async fn do_submit_toolchain(
+            &self,
+            job_alloc: JobAlloc,
+            tc: Toolchain,
+        ) -> Result<SubmitToolchainResult> {
+            assert_eq!(job_alloc.job_id, JobId(0));
+            assert_eq!(self.tc, tc);
+
+            Ok(SubmitToolchainResult::Success)
+        }
+        async fn do_run_job(
+            &self,
+            job_alloc: JobAlloc,
+            command: CompileCommand,
+            outputs: Vec<String>,
+            inputs_packager: Box<dyn pkg::InputsPackager>,
+        ) -> Result<(RunJobResult, PathTransformer)> {
+            assert_eq!(job_alloc.job_id, JobId(0));
+            assert_eq!(command.executable, "/overridden/compiler");
+
+            let mut inputs = vec![];
+            let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
+            let outputs = outputs
+                .into_iter()
+                .map(|name| {
+                    let data = format!("some data in {}", name);
+                    let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
+                    (name, data)
+                })
+                .collect();
+            let result = RunJobResult::Complete(JobComplete {
+                output: self.output.clone(),
+                outputs,
+            });
+            Ok((result, path_transformer))
+        }
+        async fn put_toolchain(
+            &self,
+            _: PathBuf,
+            _: String,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+            Ok((
+                self.tc.clone(),
+                Some((
+                    "/overridden/compiler".to_owned(),
+                    PathBuf::from("somearchiveid"),
+                )),
+            ))
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn retry_on_compile_fail(&self) -> bool {
+            true
         }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None

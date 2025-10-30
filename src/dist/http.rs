@@ -1094,6 +1094,7 @@ mod client {
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
+        retry_on_compile_fail: bool,
     }
 
     impl Client {
@@ -1105,6 +1106,7 @@ mod client {
             toolchain_configs: &[config::DistToolchainConfig],
             auth_token: String,
             rewrite_includes_only: bool,
+            retry_on_compile_fail: bool,
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
@@ -1127,6 +1129,7 @@ mod client {
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
+                retry_on_compile_fail,
             })
         }
 
@@ -1316,6 +1319,9 @@ mod client {
 
         fn rewrite_includes_only(&self) -> bool {
             self.rewrite_includes_only
+        }
+        fn retry_on_compile_fail(&self) -> bool {
+            self.retry_on_compile_fail
         }
         fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {
             match self.tc_cache.get_custom_toolchain(exe) {

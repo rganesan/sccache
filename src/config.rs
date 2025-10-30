@@ -533,6 +533,7 @@ pub struct DistConfig {
     pub toolchains: Vec<DistToolchainConfig>,
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    pub retry_on_compile_fail: bool,
 }
 
 impl Default for DistConfig {
@@ -544,6 +545,7 @@ impl Default for DistConfig {
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            retry_on_compile_fail: false,
         }
     }
 }
@@ -965,7 +967,7 @@ impl Config {
 
         let FileConfig {
             cache,
-            dist,
+            mut dist,
             server_startup_timeout_ms,
         } = file_conf;
         conf_caches.merge(cache);
@@ -975,6 +977,13 @@ impl Config {
 
         let EnvConfig { cache } = env_conf;
         conf_caches.merge(cache);
+
+        // Allow environment variable to override dist retry_on_compile_fail setting
+        if let Ok(Some(retry_on_compile_fail)) =
+            bool_from_env_var("SCCACHE_DIST_RETRY_ON_COMPILE_FAIL")
+        {
+            dist.retry_on_compile_fail = retry_on_compile_fail;
+        }
 
         let (caches, fallback_cache) = conf_caches.into_fallback();
         Self {
@@ -1590,6 +1599,7 @@ no_credentials = true
                 toolchains: vec![],
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
+                retry_on_compile_fail: false,
             },
             server_startup_timeout_ms: Some(10000),
         }
