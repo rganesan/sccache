@@ -58,6 +58,7 @@ fn config_with_dist_auth(
             toolchains: vec![],
             toolchain_cache_size: 0,
             rewrite_includes_only: true,
+            retry_on_compile_fail: false,
         },
         server_startup_timeout_ms: None,
     }
