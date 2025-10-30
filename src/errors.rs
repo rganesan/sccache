@@ -32,12 +32,19 @@ pub struct HttpClientError(pub String);
 #[derive(Debug)]
 pub struct ProcessError(pub process::Output);
 
+#[derive(Debug)]
+pub struct RemoteCompileFailure {
+    pub exit_code: i32,
+}
+
 #[cfg(feature = "hyper")]
 impl std::error::Error for BadHttpStatusError {}
 
 impl std::error::Error for HttpClientError {}
 
 impl std::error::Error for ProcessError {}
+
+impl std::error::Error for RemoteCompileFailure {}
 
 #[cfg(feature = "hyper")]
 impl std::fmt::Display for BadHttpStatusError {
@@ -55,6 +62,12 @@ impl std::fmt::Display for HttpClientError {
 impl std::fmt::Display for ProcessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", String::from_utf8_lossy(&self.0.stderr))
+    }
+}
+
+impl std::fmt::Display for RemoteCompileFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Remote compilation failed with exit code {}", self.exit_code)
     }
 }
 

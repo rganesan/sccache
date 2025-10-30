@@ -449,6 +449,9 @@ impl ProcessOutput {
             stderr,
         })
     }
+    pub fn exit_code(&self) -> i32 {
+        self.code
+    }
     #[cfg(test)]
     pub fn fake_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         Self {
@@ -752,5 +755,6 @@ pub trait Client: Send + Sync {
         toolchain_packager: Box<dyn pkg::ToolchainPackager>,
     ) -> Result<(Toolchain, Option<(String, PathBuf)>)>;
     fn rewrite_includes_only(&self) -> bool;
+    fn retry_on_compile_fail(&self) -> bool;
     fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }
