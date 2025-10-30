@@ -14,6 +14,9 @@ toolchains = []
 # the maximum size of the toolchain cache in bytes
 toolchain_cache_size = 5368709120
 cache_dir = "/home/user/.cache/sccache-dist-client"
+# automatically retry compilation locally if remote compilation fails
+# useful when remote build environments have configuration issues
+retry_on_compile_fail = false
 
 [dist.auth]
 type = "token"
@@ -147,6 +150,10 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_LOG_MILLIS` when set (to any value), enables millisecond precision timestamps in log output instead of the default second precision.
 * `SCCACHE_ERROR_LOG` path to a file where sccache will log errors
 * `SCCACHE_LOG` log level, accepting standard env_logger values, see [env_logger documentation](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) for details
+
+### distributed compilation
+
+* `SCCACHE_DIST_RETRY_ON_COMPILE_FAIL` automatically retry compilation locally if the remote compiler returns a non-zero exit code. Set to `true`, `on`, or `1` to enable; `false`, `off`, or `0` to disable (default: disabled). Useful when remote build environments have configuration issues or missing dependencies while the same code compiles successfully locally.
 
 ### cache configs
 
