@@ -20,6 +20,8 @@ pub use self::server::{
     ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, Scheduler, ServerAuthCheck,
 };
 
+pub use self::common::ServerLoadMetrics;
+
 mod common {
     use reqwest::header;
     use serde::{Deserialize, Serialize};
@@ -150,6 +152,18 @@ mod common {
         pub cert_pem: Vec<u8>,
     }
 
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ServerLoadMetrics {
+        // PSI metrics (10-second averages, as percentages 0-100)
+        pub cpu_pressure_avg10: f32,      // CPU contention
+        pub memory_pressure_avg10: f32,   // Memory pressure
+        pub io_pressure_avg10: f32,       // I/O wait
+
+        // Additional metrics
+        pub load_average_1min: f32,        // System load average
+    }
+
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct HeartbeatServerHttpRequest {
@@ -158,6 +172,10 @@ mod common {
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
+
+        // Load metrics from the server
+        #[serde(default)]
+        pub load_metrics: Option<ServerLoadMetrics>,
     }
     // cert_pem is quite long so elide it (you can retrieve it by hitting the server url anyway)
     impl fmt::Debug for HeartbeatServerHttpRequest {
@@ -168,15 +186,17 @@ mod common {
                 server_nonce,
                 cert_digest,
                 cert_pem,
+                load_metrics,
             } = self;
             write!(
                 f,
-                "HeartbeatServerHttpRequest {{ jwt_key: {:?}, num_cpus: {:?}, server_nonce: {:?}, cert_digest: {:?}, cert_pem: [...{} bytes...] }}",
+                "HeartbeatServerHttpRequest {{ jwt_key: {:?}, num_cpus: {:?}, server_nonce: {:?}, cert_digest: {:?}, cert_pem: [...{} bytes...], load_metrics: {:?} }}",
                 jwt_key,
                 num_cpus,
                 server_nonce,
                 cert_digest,
-                cert_pem.len()
+                cert_pem.len(),
+                load_metrics
             )
         }
     }
@@ -811,7 +831,7 @@ mod server {
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
-                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem, load_metrics } = heartbeat_server;
                         try_or_500_log!(req_id, maybe_update_certs(
                             &mut requester.client.lock().unwrap(),
                             &mut server_certificates.lock().unwrap(),
@@ -821,7 +841,8 @@ mod server {
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
                             num_cpus,
-                            job_authorizer
+                            job_authorizer,
+                            load_metrics
                         ));
                         prepare_response(request, &res)
                     },
@@ -875,6 +896,26 @@ mod server {
             bincode_req(req.bearer_auth(auth).bincode(&tc)?)
                 .context("POST to scheduler assign_job failed")
         }
+    }
+
+    fn collect_load_metrics() -> Option<super::common::ServerLoadMetrics> {
+        use crate::util::{read_psi_metrics, read_load_average};
+
+        let (cpu_pressure, memory_pressure, io_pressure) = read_psi_metrics().ok()?;
+        let load_avg_1min = read_load_average().unwrap_or(0.0);
+
+        let metrics = super::common::ServerLoadMetrics {
+            cpu_pressure_avg10: cpu_pressure,
+            memory_pressure_avg10: memory_pressure,
+            io_pressure_avg10: io_pressure,
+            load_average_1min: load_avg_1min,
+        };
+
+        trace!(target: "sccache_heartbeat",
+            "Sending PSI metrics: CPU={:.1}%, Mem={:.1}%, I/O={:.1}%",
+            cpu_pressure, memory_pressure, io_pressure);
+
+        Some(metrics)
     }
 
     pub struct Server<S> {
@@ -932,13 +973,12 @@ mod server {
                 server_nonce,
                 handler,
             } = self;
-            let heartbeat_req = HeartbeatServerHttpRequest {
-                num_cpus: num_cpus(),
-                jwt_key: jwt_key.clone(),
-                server_nonce,
-                cert_digest,
-                cert_pem: cert_pem.clone(),
-            };
+            let heartbeat_num_cpus = num_cpus();
+            let heartbeat_jwt_key = jwt_key.clone();
+            let heartbeat_server_nonce = server_nonce;
+            let heartbeat_cert_digest = cert_digest;
+            let heartbeat_cert_pem = cert_pem.clone();
+
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
             let requester = ServerRequester {
@@ -952,6 +992,19 @@ mod server {
                 let client = new_reqwest_blocking_client();
                 loop {
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
+
+                    // Collect fresh load metrics each heartbeat
+                    let load_metrics = collect_load_metrics();
+
+                    let heartbeat_req = HeartbeatServerHttpRequest {
+                        num_cpus: heartbeat_num_cpus,
+                        jwt_key: heartbeat_jwt_key.clone(),
+                        server_nonce: heartbeat_server_nonce.clone(),
+                        cert_digest: heartbeat_cert_digest.clone(),
+                        cert_pem: heartbeat_cert_pem.clone(),
+                        load_metrics,
+                    };
+
                     match bincode_req(
                         client
                             .post(heartbeat_url.clone())

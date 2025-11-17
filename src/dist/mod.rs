@@ -680,6 +680,7 @@ pub trait SchedulerIncoming: Send + Sync {
         server_nonce: ServerNonce,
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
+        load_metrics: Option<http::ServerLoadMetrics>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server
     fn handle_update_job_state(

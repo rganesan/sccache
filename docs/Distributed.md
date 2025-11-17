@@ -31,6 +31,9 @@ may request compilation from Linux, Windows or macOS. Linux compilations will
 attempt to automatically package the compiler in use, while Windows and macOS
 users will need to specify a toolchain for cross-compilation ahead of time.
 
+**Advanced Topics:**
+- [Load-Aware Scheduling](LoadAwareScheduling.md) - Use Linux PSI metrics for intelligent job distribution
+
 ## Communication
 
 The HTTP implementation of sccache has the following API, where all HTTP body content is encoded using [`bincode`](http://docs.rs/bincode):
@@ -513,6 +516,9 @@ This occurs because distributed compilation sends preprocessed code to the remot
 
 The solution is to adjust your code to use `__attribute__((fallthrough))` instead of comments, which is preserved through preprocessing.
 
+---
+
+**See also:** [Load-Aware Scheduling](LoadAwareScheduling.md) for information on optimizing job distribution across servers using real-time load metrics.
 
 # Building the Distributed Server Binaries
 

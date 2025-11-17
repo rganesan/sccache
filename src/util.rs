@@ -1015,6 +1015,66 @@ pub fn num_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
+/// Read Linux PSI (Pressure Stall Information) metrics
+/// Returns (cpu_pressure, memory_pressure, io_pressure) as 10-second averages (0-100 percentages)
+#[cfg(target_os = "linux")]
+pub fn read_psi_metrics() -> Result<(f32, f32, f32)> {
+    use fs_err as fs;
+
+    fn parse_psi_avg10(path: &str) -> Result<f32> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read PSI file: {}", path))?;
+        // Parse "some avg10=2.04 avg60=..."
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("some ") {
+                for part in rest.split_whitespace() {
+                    if let Some(val) = part.strip_prefix("avg10=") {
+                        return val.parse::<f32>()
+                            .context("Failed to parse PSI avg10 value");
+                    }
+                }
+            }
+        }
+        bail!("Could not find PSI avg10 value in {}", path)
+    }
+
+    let cpu_pressure = parse_psi_avg10("/proc/pressure/cpu")
+        .unwrap_or(0.0);  // Fallback if PSI not available
+    let memory_pressure = parse_psi_avg10("/proc/pressure/memory")
+        .unwrap_or(0.0);
+    let io_pressure = parse_psi_avg10("/proc/pressure/io")
+        .unwrap_or(0.0);
+
+    Ok((cpu_pressure, memory_pressure, io_pressure))
+}
+
+/// Read Linux PSI (Pressure Stall Information) metrics
+/// Returns (cpu_pressure, memory_pressure, io_pressure) - not available on non-Linux systems
+#[cfg(not(target_os = "linux"))]
+pub fn read_psi_metrics() -> Result<(f32, f32, f32)> {
+    Ok((0.0, 0.0, 0.0))  // PSI only available on Linux
+}
+
+/// Read system load average (1-minute average)
+#[cfg(target_os = "linux")]
+pub fn read_load_average() -> Result<f32> {
+    use fs_err as fs;
+    let content = fs::read_to_string("/proc/loadavg")
+        .context("Failed to read /proc/loadavg")?;
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    if parts.is_empty() {
+        bail!("Empty /proc/loadavg");
+    }
+    parts[0].parse::<f32>()
+        .context("Failed to parse load average")
+}
+
+/// Read system load average (1-minute average) - not available on non-Linux systems
+#[cfg(not(target_os = "linux"))]
+pub fn read_load_average() -> Result<f32> {
+    Ok(0.0)  // Load average only available on Linux
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OsStrExt, TimeMacroFinder};
@@ -1166,5 +1226,60 @@ mod tests {
         assert_eq!(tested_cases, (alphabet.len() + 1).pow(3) - 1);
         let empty_result = super::ascii_unescape_default(&[]).unwrap();
         assert!(empty_result.is_empty(), "{:?}", empty_result);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_read_psi_metrics_parsing() {
+        // Note: This test will fail if PSI is not available on the system
+        // In CI environments without PSI, the function returns (0.0, 0.0, 0.0)
+        match super::read_psi_metrics() {
+            Ok((cpu, mem, io)) => {
+                // PSI values should be in 0-100 range (they're percentages)
+                assert!(cpu >= 0.0 && cpu <= 100.0, "CPU pressure out of range: {}", cpu);
+                assert!(mem >= 0.0 && mem <= 100.0, "Memory pressure out of range: {}", mem);
+                assert!(io >= 0.0 && io <= 100.0, "I/O pressure out of range: {}", io);
+
+                // All values being exactly 0.0 is possible but unusual on a running system
+                println!("PSI metrics: CPU={}, Memory={}, I/O={}", cpu, mem, io);
+            }
+            Err(_) => {
+                // PSI not available - this is OK (e.g., older kernels, containers)
+                println!("PSI metrics not available on this system");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_read_load_average_parsing() {
+        match super::read_load_average() {
+            Ok(load) => {
+                // Load average should be non-negative
+                assert!(load >= 0.0, "Load average should be non-negative: {}", load);
+                // Sanity check: load average > 1000 would be unusual
+                assert!(load < 1000.0, "Load average unusually high: {}", load);
+                println!("Load average (1min): {}", load);
+            }
+            Err(e) => {
+                panic!("Failed to read load average: {}", e);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_psi_metrics_non_linux() {
+        // On non-Linux platforms, should return zeros
+        let result = super::read_psi_metrics().unwrap();
+        assert_eq!(result, (0.0, 0.0, 0.0));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_load_average_non_linux() {
+        // On non-Linux platforms, should return zero
+        let result = super::read_load_average().unwrap();
+        assert_eq!(result, 0.0);
     }
 }

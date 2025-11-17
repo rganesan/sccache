@@ -359,6 +359,8 @@ struct ServerDetails {
     num_cpus: usize,
     server_nonce: ServerNonce,
     job_authorizer: Box<dyn JobAuthorizer>,
+    // Load metrics from the server
+    load_metrics: Option<sccache::dist::http::ServerLoadMetrics>,
 }
 
 impl Scheduler {
@@ -417,17 +419,60 @@ impl Default for Scheduler {
     }
 }
 
-fn load_weight(job_count: usize, core_count: usize) -> f64 {
-    // Oversubscribe cores just a little to make up for network and I/O latency. This formula is
-    // not based on hard data but an extrapolation to high core counts of the conventional wisdom
-    // that slightly more jobs than cores achieve the shortest compile time. Which is originally
-    // about local compiles and this is over the network, so be slightly less conservative.
-    let cores_plus_slack = core_count + 1 + core_count / 8;
-    // Note >=, not >, because the question is "can we add another job"?
-    if job_count >= cores_plus_slack {
-        MAX_PER_CORE_LOAD + 1f64 // no new jobs for now
+fn calculate_server_load(
+    jobs_assigned: usize,
+    num_cpus: usize,
+    load_metrics: Option<&sccache::dist::http::ServerLoadMetrics>,
+) -> f64 {
+    // Base load: job count ratio
+    let job_load = jobs_assigned as f64 / num_cpus as f64;
+
+    // If we have real-time metrics, incorporate them
+    if let Some(metrics) = load_metrics {
+        // PSI pressure values should be 0-100 percentages
+        // Clamp to valid range to handle out-of-range values
+        let cpu_pressure = metrics.cpu_pressure_avg10.clamp(0.0, 100.0) as f64;
+        let mem_pressure = metrics.memory_pressure_avg10.clamp(0.0, 100.0) as f64;
+        let io_pressure = metrics.io_pressure_avg10.clamp(0.0, 100.0) as f64;
+
+        // Weight them to influence scheduling decisions
+        //
+        // For distributed compilation:
+        // - Client does preprocessing (reads headers locally)
+        // - Server receives preprocessed output and just compiles
+        // - Server I/O is minimal: read preprocessed input, write object file
+        //
+        // Therefore: CPU pressure = Memory pressure >> I/O pressure
+
+        // CPU pressure: most critical - compilation is CPU-intensive
+        // Scale: 0% = 1.0x, 50% = 2.0x, 100% = 3.0x multiplier (strong impact)
+        let cpu_factor = 1.0 + (cpu_pressure / 50.0);
+
+        // Memory pressure: equally critical - large compilations (e.g., heavy template instantiation)
+        // are memory-intensive. Without swap, high memory pressure causes OOM kills affecting both
+        // compile jobs and system stability
+        // Scale: 0% = 1.0x, 50% = 2.0x, 100% = 3.0x multiplier (strong impact, same as CPU)
+        let mem_factor = 1.0 + (mem_pressure / 50.0);
+
+        // I/O pressure: while compilation itself does minimal I/O (only reads
+        // preprocessed input and writes object output), high I/O pressure indicates
+        // system stress (disk issues, extreme load) and should be factored in
+        // Scale: 0% = 1.0x, 100% = 1.5x multiplier (moderate impact)
+        let io_factor = 1.0 + (io_pressure / 200.0);
+
+        // Combined load score
+        let pressure_load = job_load * cpu_factor * mem_factor * io_factor;
+
+        // Cap at reasonable maximum
+        pressure_load.min(MAX_PER_CORE_LOAD + 1.0)
     } else {
-        job_count as f64 / core_count as f64
+        // Fallback to simple job count if no metrics available
+        let cores_plus_slack = num_cpus + 1 + num_cpus / 8;
+        if jobs_assigned >= cores_plus_slack {
+            MAX_PER_CORE_LOAD + 1.0
+        } else {
+            job_load
+        }
     }
 }
 
@@ -447,7 +492,11 @@ impl SchedulerIncoming for Scheduler {
                 let mut best_load: f64 = MAX_PER_CORE_LOAD;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    let load = load_weight(details.jobs_assigned.len(), details.num_cpus);
+                    let load = calculate_server_load(
+                        details.jobs_assigned.len(),
+                        details.num_cpus,
+                        details.load_metrics.as_ref(),
+                    );
 
                     if let Some(last_error) = details.last_error {
                         if load < MAX_PER_CORE_LOAD {
@@ -483,7 +532,7 @@ impl SchedulerIncoming for Scheduler {
                         }
                     } else if load < best_load {
                         best = Some((server_id, details));
-                        trace!("Selected {:?} as the server with the best load", server_id);
+                        trace!("Selected {:?} as the server with the best load ({:.2})", server_id, load);
                         best_load = load;
                         if load == 0f64 {
                             break;
@@ -577,6 +626,7 @@ impl SchedulerIncoming for Scheduler {
         server_nonce: ServerNonce,
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
+        load_metrics: Option<sccache::dist::http::ServerLoadMetrics>,
     ) -> Result<HeartbeatServerResult> {
         if num_cpus == 0 {
             bail!("Invalid number of CPUs (0) specified in heartbeat")
@@ -592,6 +642,7 @@ impl SchedulerIncoming for Scheduler {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
                 details.last_seen = now;
+                details.load_metrics = load_metrics.clone();
 
                 let mut stale_jobs = Vec::new();
                 for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
@@ -665,6 +716,9 @@ impl SchedulerIncoming for Scheduler {
             _ => (),
         }
         info!("Registered new server {:?}", server_id);
+        if load_metrics.is_some() {
+            debug!("Server {:?} has PSI metrics available", server_id);
+        }
         servers.insert(
             server_id,
             ServerDetails {
@@ -675,6 +729,7 @@ impl SchedulerIncoming for Scheduler {
                 num_cpus,
                 server_nonce,
                 job_authorizer,
+                load_metrics,
             },
         );
         Ok(HeartbeatServerResult { is_new: true })
@@ -849,5 +904,186 @@ impl ServerIncoming for Server {
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mock_load_metrics(cpu: f32, mem: f32, io: f32) -> sccache::dist::http::ServerLoadMetrics {
+        sccache::dist::http::ServerLoadMetrics {
+            cpu_pressure_avg10: cpu,
+            memory_pressure_avg10: mem,
+            io_pressure_avg10: io,
+            load_average_1min: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_calculate_server_load_no_metrics() {
+        // Fallback to job-count-based calculation when no metrics available
+        assert_eq!(calculate_server_load(0, 8, None), 0.0);
+        assert_eq!(calculate_server_load(4, 8, None), 0.5);
+        assert_eq!(calculate_server_load(8, 8, None), 1.0);
+
+        // Test oversubscription threshold (cores + 1 + cores/8)
+        // For 8 cores: 8 + 1 + 1 = 10
+        assert_eq!(calculate_server_load(9, 8, None), 1.125);
+        assert_eq!(calculate_server_load(10, 8, None), MAX_PER_CORE_LOAD + 1.0); // 3.0
+        assert_eq!(calculate_server_load(20, 8, None), MAX_PER_CORE_LOAD + 1.0); // 3.0
+    }
+
+    #[test]
+    fn test_calculate_server_load_zero_pressure() {
+        // Zero pressure should give 1.0x multiplier (no penalty)
+        let metrics = mock_load_metrics(0.0, 0.0, 0.0);
+        assert_eq!(calculate_server_load(0, 8, Some(&metrics)), 0.0); // 0.0 * 1.0 * 1.0 * 1.0
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics)), 0.5); // 0.5 * 1.0 * 1.0 * 1.0
+        assert_eq!(calculate_server_load(8, 8, Some(&metrics)), 1.0); // 1.0 * 1.0 * 1.0 * 1.0
+    }
+
+    #[test]
+    fn test_calculate_server_load_cpu_pressure() {
+        // CPU pressure: 0% = 1.0x, 50% = 2.0x, 100% = 3.0x
+        let metrics_50 = mock_load_metrics(50.0, 0.0, 0.0);
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics_50)), 1.0); // 0.5 * 2.0 = 1.0
+
+        let metrics_100 = mock_load_metrics(100.0, 0.0, 0.0);
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics_100)), 1.5); // 0.5 * 3.0 = 1.5
+    }
+
+    #[test]
+    fn test_calculate_server_load_memory_pressure() {
+        // Memory pressure: 0% = 1.0x, 50% = 2.0x, 100% = 3.0x (equal to CPU)
+        let metrics_50 = mock_load_metrics(0.0, 50.0, 0.0);
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics_50)), 1.0); // 0.5 * 2.0 = 1.0
+
+        let metrics_100 = mock_load_metrics(0.0, 100.0, 0.0);
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics_100)), 1.5); // 0.5 * 3.0 = 1.5
+    }
+
+    #[test]
+    fn test_calculate_server_load_io_pressure() {
+        // I/O pressure: 0% = 1.0x, 100% = 1.5x
+        let metrics_100 = mock_load_metrics(0.0, 0.0, 100.0);
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics_100)), 0.75); // 0.5 * 1.5 = 0.75
+    }
+
+    #[test]
+    fn test_calculate_server_load_combined_pressure() {
+        // Test combined pressure: 50% CPU, 50% memory, 100% I/O
+        // cpu_factor = 1.0 + 50.0/50.0 = 2.0
+        // mem_factor = 1.0 + 50.0/50.0 = 2.0
+        // io_factor = 1.0 + 100.0/200.0 = 1.5
+        // Total: 0.5 * 2.0 * 2.0 * 1.5 = 3.0
+        let metrics = mock_load_metrics(50.0, 50.0, 100.0);
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics)), 3.0);
+    }
+
+    #[test]
+    fn test_calculate_server_load_extreme_pressure() {
+        // Test 100% pressure on all metrics
+        // cpu_factor = 1.0 + 100.0/50.0 = 3.0
+        // mem_factor = 1.0 + 100.0/50.0 = 3.0
+        // io_factor = 1.0 + 100.0/200.0 = 1.5
+        // Total: 0.5 * 3.0 * 3.0 * 1.5 = 6.75 (capped at MAX_PER_CORE_LOAD + 1.0 = 3.0)
+        let metrics = mock_load_metrics(100.0, 100.0, 100.0);
+        assert_eq!(calculate_server_load(4, 8, Some(&metrics)), MAX_PER_CORE_LOAD + 1.0);
+    }
+
+    #[test]
+    fn test_calculate_server_load_realistic_scenarios() {
+        // Lightly loaded server: 10% CPU, 5% memory, 2% I/O
+        let light = mock_load_metrics(10.0, 5.0, 2.0);
+        let light_load = calculate_server_load(2, 8, Some(&light));
+        assert!(light_load < 0.5); // Should be better than no metrics
+        assert!(light_load > 0.25); // But not too much better
+
+        // Moderately loaded server: 40% CPU, 30% memory, 20% I/O
+        let moderate = mock_load_metrics(40.0, 30.0, 20.0);
+        let moderate_load = calculate_server_load(4, 8, Some(&moderate));
+        assert!(moderate_load > 0.5); // Should be worse than no pressure
+        assert!(moderate_load < 2.0); // But not terrible
+
+        // Heavily loaded server: 80% CPU, 90% memory, 50% I/O
+        let heavy = mock_load_metrics(80.0, 90.0, 50.0);
+        let heavy_load = calculate_server_load(6, 8, Some(&heavy));
+        assert!(heavy_load > 2.0); // Should be significantly worse
+    }
+
+    #[test]
+    fn test_calculate_server_load_mixed_server_capabilities() {
+        // Test that scheduler correctly handles servers with and without PSI metrics
+
+        // Server A: No PSI metrics (old server, non-Linux, or PSI not available)
+        // 4 jobs on 8 cores = 0.5 load
+        let server_a_load = calculate_server_load(4, 8, None);
+        assert_eq!(server_a_load, 0.5);
+
+        // Server B: Has PSI metrics with zero pressure
+        // Same 4 jobs on 8 cores, but with PSI showing 0% pressure
+        let metrics_zero = mock_load_metrics(0.0, 0.0, 0.0);
+        let server_b_load = calculate_server_load(4, 8, Some(&metrics_zero));
+        assert_eq!(server_b_load, 0.5); // Same as server A
+
+        // Server C: Has PSI metrics showing moderate pressure
+        // Same 4 jobs on 8 cores, but with 30% CPU and memory pressure
+        let metrics_moderate = mock_load_metrics(30.0, 30.0, 0.0);
+        let server_c_load = calculate_server_load(4, 8, Some(&metrics_moderate));
+        // cpu_factor = 1.0 + 30/50 = 1.6
+        // mem_factor = 1.0 + 30/50 = 1.6
+        // io_factor = 1.0
+        // load = 0.5 * 1.6 * 1.6 * 1.0 = 1.28
+        assert!((server_c_load - 1.28).abs() < 0.001, "Expected ~1.28, got {}", server_c_load);
+
+        // Verify server selection order: B (PSI zero) = A (no PSI) < C (PSI moderate)
+        assert!(server_b_load == server_a_load);
+        assert!(server_c_load > server_a_load);
+        assert!(server_c_load > server_b_load);
+    }
+
+    #[test]
+    fn test_calculate_server_load_psi_vs_no_psi_with_pressure() {
+        // Scenario: Server with PSI showing heavy load vs server without PSI but fewer jobs
+
+        // Server A: No PSI, 6 jobs on 8 cores
+        let server_a_load = calculate_server_load(6, 8, None);
+        assert_eq!(server_a_load, 0.75); // Simple ratio
+
+        // Server B: Has PSI showing 80% CPU/memory pressure, but only 4 jobs on 8 cores
+        let metrics_heavy = mock_load_metrics(80.0, 80.0, 0.0);
+        let server_b_load = calculate_server_load(4, 8, Some(&metrics_heavy));
+        // cpu_factor = 1.0 + 80/50 = 2.6
+        // mem_factor = 1.0 + 80/50 = 2.6
+        // io_factor = 1.0
+        // load = 0.5 * 2.6 * 2.6 * 1.0 = 3.38 (capped at 3.0)
+        assert_eq!(server_b_load, MAX_PER_CORE_LOAD + 1.0);
+
+        // Even though server B has fewer jobs, it should be avoided due to high pressure
+        assert!(server_b_load > server_a_load);
+    }
+
+    #[test]
+    fn test_calculate_server_load_fallback_consistency() {
+        // Verify that servers without PSI metrics use consistent fallback logic
+
+        // Test various job counts with no metrics
+        assert_eq!(calculate_server_load(0, 8, None), 0.0);
+        assert_eq!(calculate_server_load(4, 8, None), 0.5);
+        assert_eq!(calculate_server_load(8, 8, None), 1.0);
+
+        // Test oversubscription threshold: 8 + 1 + 8/8 = 10
+        assert_eq!(calculate_server_load(9, 8, None), 1.125);
+        assert_eq!(calculate_server_load(10, 8, None), MAX_PER_CORE_LOAD + 1.0);
+
+        // Test with different core counts
+        // 16 cores: threshold = 16 + 1 + 16/8 = 19
+        assert_eq!(calculate_server_load(18, 16, None), 1.125);
+        assert_eq!(calculate_server_load(19, 16, None), MAX_PER_CORE_LOAD + 1.0);
+
+        // 4 cores: threshold = 4 + 1 + 4/8 = 5
+        assert_eq!(calculate_server_load(4, 4, None), 1.0);
+        assert_eq!(calculate_server_load(5, 4, None), MAX_PER_CORE_LOAD + 1.0);
     }
 }
