@@ -319,7 +319,7 @@ impl DistClientContainer {
                 _ => unreachable!(),
             };
             info!("Attempting to recreate the dist client");
-            *state = Self::create_state(*config).await
+            *state = Self::create_state(*config).await;
         }
     }
 
@@ -438,9 +438,9 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             l.set(
                 info.location()
                     .map(|loc| (loc.file().to_string(), loc.line(), loc.column())),
-            )
+            );
         });
-        panic_hook(info)
+        panic_hook(info);
     }));
     let client = Client::new();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1271,9 +1271,9 @@ where
                             debug!(
                                 "parse_arguments: CannotCache({}, {}): {:?}",
                                 why, extra_info, cmd
-                            )
+                            );
                         } else {
-                            debug!("parse_arguments: CannotCache({}): {:?}", why, cmd)
+                            debug!("parse_arguments: CannotCache({}): {:?}", why, cmd);
                         }
                         let mut stats = self.stats.lock().await;
                         stats.requests_not_cacheable += 1;
@@ -1438,7 +1438,7 @@ where
                                 stats.compiler_write_duration += duration;
                                 stats.compile_fails += 1;
                             }
-                        };
+                        }
 
                         match dist_type {
                             DistType::NoDist => {}
@@ -1464,7 +1464,7 @@ where
                         match status.code() {
                             Some(code) => res.retcode = Some(code),
                             None => res.signal = Some(get_signal(status)),
-                        };
+                        }
 
                         res.stdout = stdout;
                         res.stderr = stderr;
@@ -1480,7 +1480,7 @@ where
                                 match output.status.code() {
                                     Some(code) => res.retcode = Some(code),
                                     None => res.signal = Some(get_signal(output.status)),
-                                };
+                                }
                                 res.stdout = output.stdout;
                                 res.stderr = output.stderr;
                             }
@@ -1518,7 +1518,7 @@ where
                             },
                         }
                     }
-                };
+                }
 
                 if let Some(cache_write) = cache_write {
                     match cache_write.await {
