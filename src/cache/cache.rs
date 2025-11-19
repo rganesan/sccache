@@ -637,6 +637,7 @@ pub fn storage_from_config(
                 url,
                 ttl,
                 key_prefix,
+                persist_stats: _,
             }) => {
                 let storage = match (endpoint, cluster_endpoints, url) {
                     (Some(url), None, None) => {

@@ -325,6 +325,12 @@ pub struct RedisCacheConfig {
 
     #[serde(default)]
     pub key_prefix: String,
+
+    /// Enable persistent stats storage in Redis.
+    /// When enabled, compilation stats are stored atomically in Redis
+    /// and aggregated across all instances using this cache.
+    #[serde(default)]
+    pub persist_stats: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,6 +731,7 @@ fn config_from_env() -> Result<EnvConfig> {
                 db,
                 ttl,
                 key_prefix,
+                persist_stats: false, // Default to false, can be enabled via config file
             })
         }
     };

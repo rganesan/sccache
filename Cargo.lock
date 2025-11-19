@@ -2792,6 +2792,7 @@ dependencies = [
  "openssl",
  "predicates",
  "rand 0.8.5",
+ "redis",
  "regex",
  "reqsign 0.18.0",
  "reqwest 0.12.9",

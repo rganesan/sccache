@@ -25,6 +25,8 @@ use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
+#[cfg(feature = "redis-stats")]
+use crate::stats::stats_storage_from_config;
 use crate::util;
 #[cfg(feature = "dist-client")]
 use anyhow::Context as _;
@@ -492,13 +494,32 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         _ => raw_storage,
     };
 
+    // Initialize stats storage if Redis persist_stats is enabled
+    #[cfg(feature = "redis-stats")]
+    let stats_storage = runtime.block_on(async {
+        match stats_storage_from_config(config, &pool).await {
+            Ok(storage) => storage,
+            Err(err) => {
+                error!("Failed to initialize stats storage: {err:?}");
+                None
+            }
+        }
+    });
+
     let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
         match addr {
             crate::net::SocketAddr::Net(addr) => {
                 trace!("binding TCP {addr}");
                 let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    #[cfg(feature = "redis-stats")]
+                    stats_storage.clone(),
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -513,8 +534,15 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::bind(path)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    #[cfg(feature = "redis-stats")]
+                    stats_storage.clone(),
+                );
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -530,8 +558,15 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     let _guard = runtime.enter();
                     tokio::net::UnixListener::from_std(l)?
                 };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let srv = SccacheServer::<_>::with_listener(
+                    l,
+                    runtime,
+                    client,
+                    dist_client,
+                    storage,
+                    #[cfg(feature = "redis-stats")]
+                    stats_storage.clone(),
+                );
                 Ok((
                     srv.local_addr()
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.to_vec())),
@@ -597,6 +632,8 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             client,
             dist_client,
             storage,
+            #[cfg(feature = "redis-stats")]
+            None, // Test helper doesn't initialize stats storage
         ))
     }
 }
@@ -608,13 +645,60 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         client: Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        #[cfg(feature = "redis-stats")]
+        stats_storage: Option<Arc<dyn crate::stats::StatsStorage>>,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service = SccacheService::new(dist_client, storage, &client, pool, tx, info);
+
+        // Load initial stats from Redis if stats persistence is enabled
+        #[cfg(feature = "redis-stats")]
+        let initial_stats = if let Some(ref storage) = stats_storage {
+            match pool.block_on(storage.get_stats()) {
+                Ok(stats) => {
+                    info!("Loaded initial stats from Redis");
+                    stats
+                }
+                Err(e) => {
+                    warn!("Failed to load initial stats from Redis: {e:?}, starting with empty stats");
+                    ServerStats::default()
+                }
+            }
+        } else {
+            ServerStats::default()
+        };
+        #[cfg(not(feature = "redis-stats"))]
+        let initial_stats = ServerStats::default();
+
+        let service = SccacheService::new(
+            dist_client,
+            storage,
+            #[cfg(feature = "redis-stats")]
+            stats_storage,
+            &client,
+            pool.clone(),
+            tx,
+            info,
+            initial_stats,
+        );
+
+        // Spawn background task to periodically flush stats to Redis
+        #[cfg(feature = "redis-stats")]
+        {
+            let service_clone = service.clone();
+            pool.spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(10));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = service_clone.flush_stats_to_redis().await {
+                        warn!("Failed to flush stats to Redis: {e:?}");
+                    }
+                }
+            });
+        }
 
         SccacheServer {
             runtime,
@@ -789,6 +873,15 @@ where
     /// Server statistics.
     stats: Arc<Mutex<ServerStats>>,
 
+    /// Persistent stats storage (optional, Redis-based).
+    #[cfg(feature = "redis-stats")]
+    stats_storage: Option<Arc<dyn crate::stats::StatsStorage>>,
+
+    /// Baseline stats that were last flushed to Redis.
+    /// Used to compute deltas for incremental updates.
+    #[cfg(feature = "redis-stats")]
+    stats_baseline: Arc<Mutex<ServerStats>>,
+
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
 
@@ -920,13 +1013,20 @@ where
     pub fn new(
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        #[cfg(feature = "redis-stats")]
+        stats_storage: Option<Arc<dyn crate::stats::StatsStorage>>,
         client: &Client,
         rt: tokio::runtime::Handle,
         tx: mpsc::Sender<ServerMessage>,
         info: ActiveInfo,
+        initial_stats: ServerStats,
     ) -> SccacheService<C> {
         SccacheService {
-            stats: Arc::default(),
+            stats: Arc::new(Mutex::new(initial_stats.clone())),
+            #[cfg(feature = "redis-stats")]
+            stats_storage,
+            #[cfg(feature = "redis-stats")]
+            stats_baseline: Arc::new(Mutex::new(initial_stats)),
             dist_client: Arc::new(dist_client),
             storage,
             compilers: Arc::default(),
@@ -938,6 +1038,33 @@ where
         }
     }
 
+    /// Flush accumulated stats to Redis (if enabled)
+    /// Computes delta since last flush and atomically increments Redis counters
+    #[cfg(feature = "redis-stats")]
+    async fn flush_stats_to_redis(&self) -> Result<()> {
+        if let Some(ref stats_storage) = self.stats_storage {
+            // Lock both stats and baseline
+            let current_stats = self.stats.lock().await.clone();
+            let mut baseline = self.stats_baseline.lock().await;
+
+            // Compute delta since last flush
+            let delta = current_stats.compute_delta(&baseline);
+
+            // Only flush if there are actual changes
+            if delta.compile_requests > 0 || delta.compilations > 0 {
+                debug!("Flushing stats delta to Redis: {} compile requests, {} compilations",
+                       delta.compile_requests, delta.compilations);
+
+                // Atomically increment stats in Redis
+                stats_storage.increment_stats(&delta).await?;
+
+                // Update baseline to current stats after successful flush
+                *baseline = current_stats;
+            }
+        }
+        Ok(())
+    }
+
     pub fn mock_with_storage(
         storage: Arc<dyn Storage>,
         rt: tokio::runtime::Handle,
@@ -946,17 +1073,17 @@ where
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
         let dist_client = DistClientContainer::new_disabled();
-        SccacheService {
-            stats: Arc::default(),
-            dist_client: Arc::new(dist_client),
+        SccacheService::new(
+            dist_client,
             storage,
-            compilers: Arc::default(),
-            compiler_proxies: Arc::default(),
+            #[cfg(feature = "redis-stats")]
+            None,
+            &client,
             rt,
-            creator: C::new(&client),
             tx,
             info,
-        }
+            ServerStats::default(),
+        )
     }
 
     #[cfg(feature = "dist-client")]
@@ -968,29 +1095,30 @@ where
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
-        SccacheService {
-            stats: Arc::default(),
-            dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
-                Box::new(DistClientConfig {
-                    pool: rt.clone(),
-                    scheduler_url: None,
-                    auth: config::DistAuth::Token { token: "".into() },
-                    cache_dir: "".into(),
-                    toolchain_cache_size: 0,
-                    toolchains: vec![],
-                    rewrite_includes_only: false,
-                    retry_on_compile_fail: false,
-                }),
-                dist_client,
-            ))),
+        let dist_client_container = DistClientContainer::new_with_state(DistClientState::Some(
+            Box::new(DistClientConfig {
+                pool: rt.clone(),
+                scheduler_url: None,
+                auth: config::DistAuth::Token { token: "".into() },
+                cache_dir: "".into(),
+                toolchain_cache_size: 0,
+                toolchains: vec![],
+                rewrite_includes_only: false,
+                retry_on_compile_fail: false,
+            }),
+            dist_client,
+        ));
+        SccacheService::new(
+            dist_client_container,
             storage,
-            compilers: Arc::default(),
-            compiler_proxies: Arc::default(),
-            rt: rt.clone(),
-            creator: C::new(&client),
+            #[cfg(feature = "redis-stats")]
+            None,
+            &client,
+            rt,
             tx,
             info,
-        }
+            ServerStats::default(),
+        )
     }
 
     fn bind<T>(self, socket: T) -> impl Future<Output = Result<()>> + Send + Sized + 'static
@@ -1046,13 +1174,40 @@ where
 
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
-        let stats = self.stats.lock().await.clone();
+        let mut stats = self.stats.lock().await.clone();
+
+        // If stats persistence is enabled, aggregate remote stats from Redis
+        #[cfg(feature = "redis-stats")]
+        if let Some(ref stats_storage) = self.stats_storage {
+            match stats_storage.get_stats().await {
+                Ok(remote_stats) => {
+                    debug!("Aggregating remote stats from Redis");
+                    stats.aggregate(&remote_stats);
+                }
+                Err(e) => {
+                    warn!("Failed to get remote stats from Redis: {e:?}, using local stats only");
+                }
+            }
+        }
+
         ServerInfo::new(stats, Some(&*self.storage)).await
     }
 
     /// Zero stats about the cache.
     async fn zero_stats(&self) {
         *self.stats.lock().await = ServerStats::default();
+
+        // Reset Redis stats if persistence is enabled
+        #[cfg(feature = "redis-stats")]
+        {
+            *self.stats_baseline.lock().await = ServerStats::default();
+
+            if let Some(ref stats_storage) = self.stats_storage {
+                if let Err(e) = stats_storage.reset_stats().await {
+                    warn!("Failed to reset stats in Redis: {e:?}");
+                }
+            }
+        }
     }
 
     /// Handle a compile request from a client.
@@ -1579,6 +1734,28 @@ impl PerLanguageCount {
     pub fn new() -> PerLanguageCount {
         Self::default()
     }
+
+    pub fn new_with_counts(counts: HashMap<String, u64>, adv_counts: HashMap<String, u64>) -> PerLanguageCount {
+        PerLanguageCount { counts, adv_counts }
+    }
+
+    pub fn counts(&self) -> &HashMap<String, u64> {
+        &self.counts
+    }
+
+    pub fn adv_counts(&self) -> &HashMap<String, u64> {
+        &self.adv_counts
+    }
+
+    /// Aggregate another PerLanguageCount into this one
+    pub fn aggregate(&mut self, other: &PerLanguageCount) {
+        for (key, value) in &other.counts {
+            *self.counts.entry(key.clone()).or_insert(0) += value;
+        }
+        for (key, value) in &other.adv_counts {
+            *self.adv_counts.entry(key.clone()).or_insert(0) += value;
+        }
+    }
 }
 
 /// Statistics about the server.
@@ -1913,6 +2090,110 @@ impl ServerStats {
                 &format!("Cache hits rate ({})", lang),
             );
         }
+    }
+
+    /// Aggregate another ServerStats into this one
+    pub fn aggregate(&mut self, other: &ServerStats) {
+        // Aggregate simple counters
+        self.compile_requests += other.compile_requests;
+        self.requests_unsupported_compiler += other.requests_unsupported_compiler;
+        self.requests_not_compile += other.requests_not_compile;
+        self.requests_not_cacheable += other.requests_not_cacheable;
+        self.requests_executed += other.requests_executed;
+        self.cache_timeouts += other.cache_timeouts;
+        self.cache_read_errors += other.cache_read_errors;
+        self.non_cacheable_compilations += other.non_cacheable_compilations;
+        self.forced_recaches += other.forced_recaches;
+        self.cache_write_errors += other.cache_write_errors;
+        self.cache_writes += other.cache_writes;
+        self.compilations += other.compilations;
+        self.compile_fails += other.compile_fails;
+        self.dist_errors += other.dist_errors;
+
+        // Aggregate durations
+        self.cache_write_duration += other.cache_write_duration;
+        self.cache_read_hit_duration += other.cache_read_hit_duration;
+        self.compiler_write_duration += other.compiler_write_duration;
+
+        // Aggregate PerLanguageCount fields
+        self.cache_errors.aggregate(&other.cache_errors);
+        self.cache_hits.aggregate(&other.cache_hits);
+        self.cache_misses.aggregate(&other.cache_misses);
+
+        // Aggregate HashMaps
+        for (key, value) in &other.not_cached {
+            *self.not_cached.entry(key.clone()).or_insert(0) += value;
+        }
+        for (key, value) in &other.dist_compiles {
+            *self.dist_compiles.entry(key.clone()).or_insert(0) += value;
+        }
+    }
+
+    /// Compute the delta between current stats and a baseline
+    /// Returns a new ServerStats containing only the increments since the baseline
+    pub fn compute_delta(&self, baseline: &ServerStats) -> ServerStats {
+        ServerStats {
+            compile_requests: self.compile_requests.saturating_sub(baseline.compile_requests),
+            requests_unsupported_compiler: self.requests_unsupported_compiler.saturating_sub(baseline.requests_unsupported_compiler),
+            requests_not_compile: self.requests_not_compile.saturating_sub(baseline.requests_not_compile),
+            requests_not_cacheable: self.requests_not_cacheable.saturating_sub(baseline.requests_not_cacheable),
+            requests_executed: self.requests_executed.saturating_sub(baseline.requests_executed),
+            cache_timeouts: self.cache_timeouts.saturating_sub(baseline.cache_timeouts),
+            cache_read_errors: self.cache_read_errors.saturating_sub(baseline.cache_read_errors),
+            non_cacheable_compilations: self.non_cacheable_compilations.saturating_sub(baseline.non_cacheable_compilations),
+            forced_recaches: self.forced_recaches.saturating_sub(baseline.forced_recaches),
+            cache_write_errors: self.cache_write_errors.saturating_sub(baseline.cache_write_errors),
+            cache_writes: self.cache_writes.saturating_sub(baseline.cache_writes),
+            compilations: self.compilations.saturating_sub(baseline.compilations),
+            compile_fails: self.compile_fails.saturating_sub(baseline.compile_fails),
+            dist_errors: self.dist_errors.saturating_sub(baseline.dist_errors),
+
+            cache_write_duration: self.cache_write_duration.saturating_sub(baseline.cache_write_duration),
+            cache_read_hit_duration: self.cache_read_hit_duration.saturating_sub(baseline.cache_read_hit_duration),
+            compiler_write_duration: self.compiler_write_duration.saturating_sub(baseline.compiler_write_duration),
+
+            cache_errors: Self::compute_language_delta(&self.cache_errors, &baseline.cache_errors),
+            cache_hits: Self::compute_language_delta(&self.cache_hits, &baseline.cache_hits),
+            cache_misses: Self::compute_language_delta(&self.cache_misses, &baseline.cache_misses),
+
+            not_cached: Self::compute_hashmap_delta(&self.not_cached, &baseline.not_cached),
+            dist_compiles: Self::compute_hashmap_delta(&self.dist_compiles, &baseline.dist_compiles),
+        }
+    }
+
+    fn compute_language_delta(current: &PerLanguageCount, baseline: &PerLanguageCount) -> PerLanguageCount {
+        let mut delta_counts = HashMap::new();
+        let mut delta_adv_counts = HashMap::new();
+
+        for (key, value) in current.counts() {
+            let baseline_value = baseline.get(key).copied().unwrap_or(0);
+            let delta = value.saturating_sub(baseline_value);
+            if delta > 0 {
+                delta_counts.insert(key.clone(), delta);
+            }
+        }
+
+        for (key, value) in current.adv_counts() {
+            let baseline_value = baseline.get_adv(key).copied().unwrap_or(0);
+            let delta = value.saturating_sub(baseline_value);
+            if delta > 0 {
+                delta_adv_counts.insert(key.clone(), delta);
+            }
+        }
+
+        PerLanguageCount::new_with_counts(delta_counts, delta_adv_counts)
+    }
+
+    fn compute_hashmap_delta(current: &HashMap<String, usize>, baseline: &HashMap<String, usize>) -> HashMap<String, usize> {
+        let mut delta = HashMap::new();
+        for (key, value) in current {
+            let baseline_value = baseline.get(key).copied().unwrap_or(0);
+            let diff = value.saturating_sub(baseline_value);
+            if diff > 0 {
+                delta.insert(key.clone(), diff);
+            }
+        }
+        delta
     }
 }
 
